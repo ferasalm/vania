@@ -1,0 +1,30 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit configuration. Docs: https://docs.coderabbit.ai/guides/configure-coderabbit
+# Adapted from new-vania's config for vania (2026-11-07): main-only base branch, path
+# instructions limited to .agents/** and .opencode/** (added by the pending agent-config PR).
+language: en-US
+
+reviews:
+  profile: assertive
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: true
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - main
+  path_instructions:
+    - path: ".agents/**"
+      instructions: >-
+        Agent skill definitions (Markdown with YAML frontmatter). Check that frontmatter is
+        valid and complete, instructions are unambiguous, and nothing contradicts AGENTS.md.
+    - path: ".opencode/**"
+      instructions: >-
+        OpenCode agent/command/rule definitions. Check frontmatter validity and that
+        referenced skills/paths exist.
+
+chat:
+  auto_reply: true
