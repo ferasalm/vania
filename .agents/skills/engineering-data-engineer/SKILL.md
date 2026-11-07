@@ -130,10 +130,17 @@ def upsert_silver(bronze_table: str, silver_table: str, pk_cols: list[str]) -> N
 
     # One-time upgrade migration: quarantine + remove null-key rows that the previous
     # implementation already stored in Silver, so the table meets the non-null key
-    # contract. Safe to re-run: only rows still violating the contract are touched.
+    # contract. Retry-safe: same anti-join on stable record identity where those columns
+    # exist (file-based legacy rows); streaming-legacy rows lack `_source_file` and are
+    # keyed by their Kafka identity — extend the identity columns as noted above.
     if DeltaTable.isDeltaTable(spark, silver_table):
-        existing = spark.read.format("delta").load(silver_table)
-        legacy_nulls = existing.where(null_filter)
+        identity_cols = [*pk_cols, "_ingested_at", "_source_file"]
+        legacy = spark.read.format("delta").load(silver_table)
+        if all(c in legacy.columns for c in identity_cols):
+            seen = spark.read.format("delta").load(q_path).select(*identity_cols)
+            legacy_nulls = legacy.where(null_filter).join(seen, on=identity_cols, how="left_anti")
+        else:
+            legacy_nulls = legacy.where(null_filter)
         if not legacy_nulls.isEmpty():
             legacy_nulls.write.format("delta").mode("append") \
                 .option("mergeSchema", "true") \
@@ -271,6 +278,10 @@ def stream_bronze_orders(kafka_bootstrap: str, topic: str, bronze_path: str):
         col("timestamp").alias("_kafka_timestamp"),
         current_timestamp().alias("_ingested_at")
     ).select("data.*", "_kafka_timestamp", "_ingested_at")
+    # NOTE: streaming rows lack Bronze's `_source_file` identity (that column exists only
+    # for file-based ingest). For quarantine anti-joins on streaming data, extend the
+    # record identity with Kafka's topic/partition/offset (enable offset columns in the
+    # stream reader) instead of `_source_file`; the anti-join keys are identity-driven.
 
     return parsed.writeStream \
         .format("delta") \
