@@ -1,5 +1,5 @@
 ---
-name: 'agency-data-engineer'
+name: 'engineering-data-engineer'
 description: 'Expert data engineer specializing in building reliable data pipelines, lakehouse architectures, and scalable data infrastructure. Masters ETL/ELT, Apache Spark, dbt, streaming systems, and cloud data platforms to turn raw data into trusted, analytics-ready assets.'
 ---
 
@@ -70,6 +70,10 @@ spark = SparkSession.builder \
 
 # ── Bronze: raw ingest (append-only, schema-on-read) ─────────────────────────
 def ingest_bronze(source_path: str, bronze_table: str, source_system: str) -> int:
+    # DESIGN INTENT: Bronze is INTENTIONALLY append-only. Re-running this for the same
+    # source appends duplicate rows by design (raw, audit-friendly lineage layer).
+    # Idempotency is enforced downstream in Silver via upsert_silver's dedup-by-primary-key
+    # merge. Never "fix" this by overwriting Bronze — raw lineage would be lost.
     df = spark.read.format("json").option("inferSchema", "true").load(source_path)
     df = df.withColumn("_ingested_at", current_timestamp()) \
            .withColumn("_source_system", lit(source_system)) \
@@ -80,6 +84,33 @@ def ingest_bronze(source_path: str, bronze_table: str, source_system: str) -> in
 # ── Silver: cleanse, deduplicate, conform ────────────────────────────────────
 def upsert_silver(bronze_table: str, silver_table: str, pk_cols: list[str]) -> None:
     source = spark.read.format("delta").load(bronze_table)
+
+    # Null-key quarantine: Spark's '=' cannot match NULL keys (NULL = NULL is UNKNOWN),
+    # so null-PK rows would bypass the MERGE below and re-insert on every run — breaking
+    # the idempotency contract. Quarantine them BEFORE dedup/merge for manual triage.
+    # The predicate is built from column EXPRESSIONS (not string interpolation), so
+    # identifiers like `account-id` stay column references and never become subtraction.
+    null_filter = None
+    for c in pk_cols:
+        cond = col(c).isNull()
+        null_filter = cond if null_filter is None else (null_filter | cond)
+    null_keys = source.where(null_filter)
+
+    # Idempotent quarantine: anti-join on the stable record identity (pk + ingestion
+    # timestamp + source file), so reruns never re-append rows already quarantined
+    # even when Bronze is unchanged.
+    q_path = f"{silver_table}_quarantine_null_pk"
+    if DeltaTable.isDeltaTable(spark, q_path):
+        seen = spark.read.format("delta").load(q_path) \
+            .select(*pk_cols, "_ingested_at", "_source_file")
+        null_keys = null_keys.join(seen, on=[*pk_cols, "_ingested_at", "_source_file"], how="left_anti")
+    if not null_keys.isEmpty():
+        null_keys.write.format("delta").mode("append") \
+            .option("mergeSchema", "true") \
+            .save(q_path)
+    for c in pk_cols:
+        source = source.where(col(c).isNotNull())
+
     # Dedup: keep latest record per primary key based on ingestion time
     from pyspark.sql.window import Window
     from pyspark.sql.functions import row_number, desc
@@ -88,13 +119,33 @@ def upsert_silver(bronze_table: str, silver_table: str, pk_cols: list[str]) -> N
 
     if DeltaTable.isDeltaTable(spark, silver_table):
         target = DeltaTable.forPath(spark, silver_table)
-        merge_condition = " AND ".join([f"target.{c} = source.{c}" for c in pk_cols])
+        # Backtick-quote identifiers so hyphenated names (`account-id`) merge correctly.
+        merge_condition = " AND ".join([f"target.`{c}` = source.`{c}`" for c in pk_cols])
         target.alias("target").merge(source.alias("source"), merge_condition) \
             .whenMatchedUpdateAll() \
             .whenNotMatchedInsertAll() \
             .execute()
     else:
         source.write.format("delta").mode("overwrite").save(silver_table)
+
+    # One-time upgrade migration: quarantine + remove null-key rows that the previous
+    # implementation already stored in Silver, so the table meets the non-null key
+    # contract. Retry-safe: same anti-join on stable record identity where those columns
+    # exist (file-based legacy rows); streaming-legacy rows lack `_source_file` and are
+    # keyed by their Kafka identity — extend the identity columns as noted above.
+    if DeltaTable.isDeltaTable(spark, silver_table):
+        identity_cols = [*pk_cols, "_ingested_at", "_source_file"]
+        legacy = spark.read.format("delta").load(silver_table)
+        if all(c in legacy.columns for c in identity_cols) and DeltaTable.isDeltaTable(spark, q_path):
+            seen = spark.read.format("delta").load(q_path).select(*identity_cols)
+            legacy_nulls = legacy.where(null_filter).join(seen, on=identity_cols, how="left_anti")
+        else:
+            legacy_nulls = legacy.where(null_filter)
+        if not legacy_nulls.isEmpty():
+            legacy_nulls.write.format("delta").mode("append") \
+                .option("mergeSchema", "true") \
+                .save(q_path)
+            DeltaTable.forPath(spark, silver_table).delete(null_filter)
 
 # ── Gold: aggregated business metric ─────────────────────────────────────────
 def build_gold_daily_revenue(
@@ -216,11 +267,21 @@ def stream_bronze_orders(kafka_bootstrap: str, topic: str, bronze_path: str):
         .option("failOnDataLoss", "false") \
         .load()
 
+    # DESIGN INTENT: streaming ingest appends to Bronze by design (checkpointed).
+    # Delivery is at-least-once under normal operation, but failOnDataLoss=false means
+    # the stream continues after Kafka removes unread records (retention expiry), so
+    # silent data loss is possible without detection. A true at-least-once guarantee
+    # needs data-loss detection plus defined Kafka retention and recovery procedures.
+    # Downstream Silver dedup (with null-PK quarantine) handles replay duplicates.
     parsed = stream.select(
         from_json(col("value").cast("string"), order_schema).alias("data"),
         col("timestamp").alias("_kafka_timestamp"),
         current_timestamp().alias("_ingested_at")
     ).select("data.*", "_kafka_timestamp", "_ingested_at")
+    # NOTE: streaming rows lack Bronze's `_source_file` identity (that column exists only
+    # for file-based ingest). For quarantine anti-joins on streaming data, extend the
+    # record identity with Kafka's topic/partition/offset (enable offset columns in the
+    # stream reader) instead of `_source_file`; the anti-join keys are identity-driven.
 
     return parsed.writeStream \
         .format("delta") \

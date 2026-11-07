@@ -1,5 +1,5 @@
 ---
-name: 'agency-level-designer'
+name: 'level-designer'
 description: 'Spatial storytelling and flow specialist - Masters layout theory, pacing architecture, encounter design, and environmental narrative across all game engines'
 ---
 

@@ -1,5 +1,5 @@
 ---
-name: 'agency-game-designer'
+name: 'game-designer'
 description: 'Systems and mechanics architect - Masters GDD authorship, player psychology, economy balancing, and gameplay loop design across all engines and genres'
 ---
 
