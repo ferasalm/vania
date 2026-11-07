@@ -87,14 +87,27 @@ def upsert_silver(bronze_table: str, silver_table: str, pk_cols: list[str]) -> N
 
     # Null-key quarantine: Spark's '=' cannot match NULL keys (NULL = NULL is UNKNOWN),
     # so null-PK rows would bypass the MERGE below and re-insert on every run — breaking
-    # the idempotency contract. Quarantine them BEFORE dedup/merge for manual triage
-    # instead of silently re-inserting.
-    null_mask = " OR ".join([f"{c} IS NULL" for c in pk_cols])
-    null_keys = source.where(null_mask)
+    # the idempotency contract. Quarantine them BEFORE dedup/merge for manual triage.
+    # The predicate is built from column EXPRESSIONS (not string interpolation), so
+    # identifiers like `account-id` stay column references and never become subtraction.
+    null_filter = None
+    for c in pk_cols:
+        cond = col(c).isNull()
+        null_filter = cond if null_filter is None else (null_filter | cond)
+    null_keys = source.where(null_filter)
+
+    # Idempotent quarantine: anti-join on the stable record identity (pk + ingestion
+    # timestamp + source file), so reruns never re-append rows already quarantined
+    # even when Bronze is unchanged.
+    q_path = f"{silver_table}_quarantine_null_pk"
+    if DeltaTable.isDeltaTable(spark, q_path):
+        seen = spark.read.format("delta").load(q_path) \
+            .select(*pk_cols, "_ingested_at", "_source_file")
+        null_keys = null_keys.join(seen, on=[*pk_cols, "_ingested_at", "_source_file"], how="left_anti")
     if not null_keys.isEmpty():
         null_keys.write.format("delta").mode("append") \
             .option("mergeSchema", "true") \
-            .save(f"{silver_table}_quarantine_null_pk")
+            .save(q_path)
     for c in pk_cols:
         source = source.where(col(c).isNotNull())
 
@@ -106,13 +119,26 @@ def upsert_silver(bronze_table: str, silver_table: str, pk_cols: list[str]) -> N
 
     if DeltaTable.isDeltaTable(spark, silver_table):
         target = DeltaTable.forPath(spark, silver_table)
-        merge_condition = " AND ".join([f"target.{c} = source.{c}" for c in pk_cols])
+        # Backtick-quote identifiers so hyphenated names (`account-id`) merge correctly.
+        merge_condition = " AND ".join([f"target.`{c}` = source.`{c}`" for c in pk_cols])
         target.alias("target").merge(source.alias("source"), merge_condition) \
             .whenMatchedUpdateAll() \
             .whenNotMatchedInsertAll() \
             .execute()
     else:
         source.write.format("delta").mode("overwrite").save(silver_table)
+
+    # One-time upgrade migration: quarantine + remove null-key rows that the previous
+    # implementation already stored in Silver, so the table meets the non-null key
+    # contract. Safe to re-run: only rows still violating the contract are touched.
+    if DeltaTable.isDeltaTable(spark, silver_table):
+        existing = spark.read.format("delta").load(silver_table)
+        legacy_nulls = existing.where(null_filter)
+        if not legacy_nulls.isEmpty():
+            legacy_nulls.write.format("delta").mode("append") \
+                .option("mergeSchema", "true") \
+                .save(q_path)
+            DeltaTable.forPath(spark, silver_table).delete(null_filter)
 
 # ── Gold: aggregated business metric ─────────────────────────────────────────
 def build_gold_daily_revenue(
