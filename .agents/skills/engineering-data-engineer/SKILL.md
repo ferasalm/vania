@@ -84,6 +84,19 @@ def ingest_bronze(source_path: str, bronze_table: str, source_system: str) -> in
 # ── Silver: cleanse, deduplicate, conform ────────────────────────────────────
 def upsert_silver(bronze_table: str, silver_table: str, pk_cols: list[str]) -> None:
     source = spark.read.format("delta").load(bronze_table)
+
+    # Null-key quarantine: Spark's '=' cannot match NULL keys (NULL = NULL is UNKNOWN),
+    # so null-PK rows would bypass the MERGE below and re-insert on every run — breaking
+    # the idempotency contract. Quarantine them BEFORE dedup/merge for manual triage
+    # instead of silently re-inserting.
+    null_mask = " OR ".join([f"{c} IS NULL" for c in pk_cols])
+    null_keys = source.where(null_mask)
+    if not null_keys.isEmpty():
+        null_keys.write.format("delta").mode("append") \
+            .save(f"{silver_table}_quarantine_null_pk")
+    for c in pk_cols:
+        source = source.where(col(c).isNotNull())
+
     # Dedup: keep latest record per primary key based on ingestion time
     from pyspark.sql.window import Window
     from pyspark.sql.functions import row_number, desc
@@ -222,7 +235,8 @@ def stream_bronze_orders(kafka_bootstrap: str, topic: str, bronze_path: str):
 
     # DESIGN INTENT: streaming ingest appends to Bronze by design (checkpointed,
     # at-least-once delivery). Replays/duplicates are expected here; idempotency is
-    # enforced downstream in Silver via dedup-by-primary-key. Do not "fix" by overwriting.
+    # enforced downstream in Silver via dedup-by-primary-key (null-PK rows are
+    # quarantined before the merge — see upsert_silver). Do not "fix" by overwriting.
     parsed = stream.select(
         from_json(col("value").cast("string"), order_schema).alias("data"),
         col("timestamp").alias("_kafka_timestamp"),
