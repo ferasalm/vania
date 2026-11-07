@@ -1,5 +1,5 @@
 ---
-name: 'agency-narrative-designer'
+name: 'narrative-designer'
 description: 'Story systems and dialogue architect - Masters GDD-aligned narrative design, branching dialogue, lore architecture, and environmental storytelling across all game engines'
 ---
 

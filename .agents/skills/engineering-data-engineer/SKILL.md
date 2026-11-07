@@ -1,5 +1,5 @@
 ---
-name: 'agency-data-engineer'
+name: 'engineering-data-engineer'
 description: 'Expert data engineer specializing in building reliable data pipelines, lakehouse architectures, and scalable data infrastructure. Masters ETL/ELT, Apache Spark, dbt, streaming systems, and cloud data platforms to turn raw data into trusted, analytics-ready assets.'
 ---
 
@@ -70,6 +70,10 @@ spark = SparkSession.builder \
 
 # ── Bronze: raw ingest (append-only, schema-on-read) ─────────────────────────
 def ingest_bronze(source_path: str, bronze_table: str, source_system: str) -> int:
+    # DESIGN INTENT: Bronze is INTENTIONALLY append-only. Re-running this for the same
+    # source appends duplicate rows by design (raw, audit-friendly lineage layer).
+    # Idempotency is enforced downstream in Silver via upsert_silver's dedup-by-primary-key
+    # merge. Never "fix" this by overwriting Bronze — raw lineage would be lost.
     df = spark.read.format("json").option("inferSchema", "true").load(source_path)
     df = df.withColumn("_ingested_at", current_timestamp()) \
            .withColumn("_source_system", lit(source_system)) \
@@ -216,6 +220,9 @@ def stream_bronze_orders(kafka_bootstrap: str, topic: str, bronze_path: str):
         .option("failOnDataLoss", "false") \
         .load()
 
+    # DESIGN INTENT: streaming ingest appends to Bronze by design (checkpointed,
+    # at-least-once delivery). Replays/duplicates are expected here; idempotency is
+    # enforced downstream in Silver via dedup-by-primary-key. Do not "fix" by overwriting.
     parsed = stream.select(
         from_json(col("value").cast("string"), order_schema).alias("data"),
         col("timestamp").alias("_kafka_timestamp"),
