@@ -93,6 +93,7 @@ def upsert_silver(bronze_table: str, silver_table: str, pk_cols: list[str]) -> N
     null_keys = source.where(null_mask)
     if not null_keys.isEmpty():
         null_keys.write.format("delta").mode("append") \
+            .option("mergeSchema", "true") \
             .save(f"{silver_table}_quarantine_null_pk")
     for c in pk_cols:
         source = source.where(col(c).isNotNull())
@@ -233,10 +234,12 @@ def stream_bronze_orders(kafka_bootstrap: str, topic: str, bronze_path: str):
         .option("failOnDataLoss", "false") \
         .load()
 
-    # DESIGN INTENT: streaming ingest appends to Bronze by design (checkpointed,
-    # at-least-once delivery). Replays/duplicates are expected here; idempotency is
-    # enforced downstream in Silver via dedup-by-primary-key (null-PK rows are
-    # quarantined before the merge — see upsert_silver). Do not "fix" by overwriting.
+    # DESIGN INTENT: streaming ingest appends to Bronze by design (checkpointed).
+    # Delivery is at-least-once under normal operation, but failOnDataLoss=false means
+    # the stream continues after Kafka removes unread records (retention expiry), so
+    # silent data loss is possible without detection. A true at-least-once guarantee
+    # needs data-loss detection plus defined Kafka retention and recovery procedures.
+    # Downstream Silver dedup (with null-PK quarantine) handles replay duplicates.
     parsed = stream.select(
         from_json(col("value").cast("string"), order_schema).alias("data"),
         col("timestamp").alias("_kafka_timestamp"),
