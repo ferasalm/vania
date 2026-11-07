@@ -136,7 +136,7 @@ def upsert_silver(bronze_table: str, silver_table: str, pk_cols: list[str]) -> N
     if DeltaTable.isDeltaTable(spark, silver_table):
         identity_cols = [*pk_cols, "_ingested_at", "_source_file"]
         legacy = spark.read.format("delta").load(silver_table)
-        if all(c in legacy.columns for c in identity_cols):
+        if all(c in legacy.columns for c in identity_cols) and DeltaTable.isDeltaTable(spark, q_path):
             seen = spark.read.format("delta").load(q_path).select(*identity_cols)
             legacy_nulls = legacy.where(null_filter).join(seen, on=identity_cols, how="left_anti")
         else:
